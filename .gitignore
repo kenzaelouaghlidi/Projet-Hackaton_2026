@@ -1,0 +1,33 @@
+# ═══ SECRETS — ÉLIMINATOIRE ═══
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+
+# ═══ Node ═══
+node_modules/
+dist/
+build/
+*.log
+
+# ═══ Python ═══
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# ═══ IDE ═══
+.vscode/
+.idea/
+*.swp
+
+# ═══ OS ═══
+.DS_Store
+Thumbs.db
+
+# ═══ Data locale ═══
+data/local/
+*.sqlite
