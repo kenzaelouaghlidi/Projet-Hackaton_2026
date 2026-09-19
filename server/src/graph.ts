@@ -11,7 +11,6 @@ import {
 
 // ═══════════════════════════════════════════════════════════════
 // ANNOTATION — Schéma du StateGraph
-// Chaque champ est déclaré pour que LangGraph sache quoi persister
 // ═══════════════════════════════════════════════════════════════
 const KenzaStateAnnotation = Annotation.Root({
   request_id: Annotation<string>,
@@ -19,10 +18,13 @@ const KenzaStateAnnotation = Annotation.Root({
   conversation_id: Annotation<string | null>,
   raw_input: Annotation<string>,
   language: Annotation<string>,
+  preferred_language: Annotation<string>,
   intent: Annotation<string>,
   intent_confidence: Annotation<number>,
   client_memory: Annotation<any>,
   cart: Annotation<any>,
+  current_product: Annotation<any>,
+  current_family: Annotation<string>,
   catalogue_results: Annotation<any[]>,
   stock_status: Annotation<any>,
   delivery_estimate: Annotation<any>,
@@ -37,34 +39,31 @@ const KenzaStateAnnotation = Annotation.Root({
 });
 
 // ═══════════════════════════════════════════════════════════════
-// NŒUDS DU GRAPHE
-// Chaque nœud ajoute son nom à graph_trace (traçabilité)
+// NŒUD PRINCIPAL
 // ═══════════════════════════════════════════════════════════════
-
-// Nœud principal — appelle l'orchestrateur complet
 async function orchestrateNode(state: any): Promise<any> {
   state.graph_trace = [...(state.graph_trace || []), 'orchestrate_node'];
 
-  // Appeler l'orchestrateur (qui gère les 5 agents)
   const finalState = await orchestrateRequest(
     state.client_id,
     state.raw_input,
-    state.conversation_id
+    state.conversation_id,
+    state.preferred_language  // passer la langue préférée
   );
 
-  // Fusionner le résultat avec l'état actuel
   return {
     ...state,
     ...finalState,
-    graph_trace: [...(state.graph_trace || []), ...(finalState.graph_trace || [])],
+    graph_trace: [
+      ...(state.graph_trace || []),
+      ...(finalState.graph_trace || []),
+    ],
   };
 }
 
 // ═══════════════════════════════════════════════════════════════
 // GRAPHE LANGGRAPH + CHECKPOINTER POSTGRES
-// La mémoire longue par client (EX-04) est gérée par le checkpointer
 // ═══════════════════════════════════════════════════════════════
-
 let compiledGraph: any = null;
 let checkpointer: PostgresSaver | null = null;
 
@@ -73,12 +72,10 @@ export async function initGraph() {
 
   console.log('🔧 Initialisation du graphe LangGraph...');
 
-  // Créer le checkpointer Postgres
   checkpointer = PostgresSaver.fromConnString(process.env.DATABASE_URL!);
-  await checkpointer.setup(); // Crée les tables de checkpoint si absentes
+  await checkpointer.setup();
   console.log('   ✅ Checkpointer Postgres initialisé');
 
-  // Construire le graphe
   const builder = new StateGraph(KenzaStateAnnotation)
     .addNode('orchestrate', orchestrateNode)
     .addEdge(START, 'orchestrate')
@@ -92,7 +89,8 @@ export async function initGraph() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// FONCTION PUBLIQUE — Appelée par l'API Fastify
+// FONCTION PUBLIQUE
+// ⚠️ CORRECTION 1 : thread_id par CONVERSATION (pas par client)
 // ═══════════════════════════════════════════════════════════════
 export async function handleMessage(
   clientId: string,
@@ -101,12 +99,15 @@ export async function handleMessage(
 ): Promise<KenzaState> {
   const graph = await initGraph();
 
-  const initialState = makeInitialState(clientId, message, conversationId);
+  // ⭐ CORRECTION : thread_id = conversationId (contexte de la conv)
+  // Si pas de conversationId, génère un basé sur clientId + timestamp
+  const threadId = conversationId || `conv-${clientId}-${Date.now()}`;
 
-  // Thread ID = clientId → mémoire longue par client (EX-04)
+  const initialState = makeInitialState(clientId, message, threadId);
+
   const config = {
     configurable: {
-      thread_id: clientId,
+      thread_id: threadId,  // ⭐ 1 thread par conversation
     },
   };
 
@@ -116,13 +117,13 @@ export async function handleMessage(
 }
 
 // ═══════════════════════════════════════════════════════════════
-// FONCTION DE LECTURE — Récupérer la mémoire d'un client
+// LECTURE MÉMOIRE
 // ═══════════════════════════════════════════════════════════════
-export async function getClientMemory(clientId: string): Promise<any> {
+export async function getClientMemory(threadId: string): Promise<any> {
   const graph = await initGraph();
   const config = {
     configurable: {
-      thread_id: clientId,
+      thread_id: threadId,
     },
   };
 

@@ -5,9 +5,9 @@ import { db } from './db';
 import { embed } from './llm';
 
 // ═══════════════════════════════════════════════════════════════
-// CONSTANTES MÉTIER — D'après politique-commerciale.md
+// CONSTANTES MÉTIER
 // ═══════════════════════════════════════════════════════════════
-export const DISCOUNT_FLOOR = 0.10;  // 10% max sans validation humaine
+export const DISCOUNT_FLOOR = 0.10;
 
 export const DISCOUNT_CODES: Record<string, number> = {
   LOYAL10: 0.10,
@@ -15,26 +15,237 @@ export const DISCOUNT_CODES: Record<string, number> = {
 };
 
 // ═══════════════════════════════════════════════════════════════
-// OUTIL 1 — search_product (recherche sémantique via pgvector)
+// OUTIL 1 — search_product (RECHERCHE HYBRIDE : mots-clés + embedding)
+// ⭐ Utilise le paramètre `famille` passé par agents.ts
 // ═══════════════════════════════════════════════════════════════
-export async function searchProduct(query: string, limit = 5) {
+export async function searchProduct(
+  query: string,
+  limit = 30,
+  genre?: string,
+  famille?: string
+) {
+  const queryLower = query.toLowerCase().trim();
+
+  // ⭐ Mots-clés structurés
+  const FAMILLES = [
+    'pantalon',
+    'robe',
+    'caftan',
+    'chaussures',
+    'blouson',
+    'chemise',
+    'veste',
+    'sac',
+    'ceinture',
+    'foulard',
+    'costume',
+    'montre',
+    'sandales',
+    'baskets',
+    'bottes',
+    'chemisier',
+    'pull',
+    'manteau',
+  ];
+
+  const COULEURS = [
+    'beige',
+    'noir',
+    'noire',
+    'blanc',
+    'blanche',
+    'bleu',
+    'bleue',
+    'rouge',
+    'vert',
+    'verte',
+    'jaune',
+    'rose',
+    'marron',
+    'gris',
+    'grise',
+    'doré',
+    'argenté',
+    'terracotta',
+    'camel',
+    'ivoire',
+    'olive',
+    'bordeaux',
+    'turquoise',
+    'bleu nuit',
+    'gris perle',
+    'blanc cassé',
+    'vert olive',
+  ];
+
+  const TAILLES = [
+    '38',
+    '39',
+    '40',
+    '41',
+    '42',
+    '43',
+    '44',
+    '45',
+    '46',
+    'S',
+    'M',
+    'L',
+    'XL',
+    'XXL',
+    'unique',
+  ];
+
+  const famillesTrouvees = FAMILLES.filter((f) => queryLower.includes(f));
+  const couleursTrouvees = COULEURS.filter((c) => queryLower.includes(c));
+  const taillesTrouvees = TAILLES.filter((t) => {
+    const regex = new RegExp(`\\b${t.toLowerCase()}\\b`, 'i');
+    return regex.test(queryLower);
+  });
+
+  // ⭐ CORRECTION : utiliser le paramètre famille si aucune famille dans la requête
+  const familleEffective = famillesTrouvees.length > 0
+    ? famillesTrouvees
+    : (famille ? [famille] : []);
+
+  console.log(
+    `🔎 Extraction : familles=[${famillesTrouvees}], couleurs=[${couleursTrouvees}], tailles=[${taillesTrouvees}]`
+  );
+  if (famille && famillesTrouvees.length === 0) {
+    console.log(`🎯 Famille fournie en paramètre : ${famille}`);
+  }
+
+  // ⭐ ÉTAPE 1 : Recherche SQL directe si famille détectée OU passée
+  if (familleEffective.length > 0) {
+    let sql = `SELECT ref, modele, famille, genre, couleur, taille, matiere, saison,
+                      prix_mad, stock, delai_reassort_jours
+               FROM products
+               WHERE stock > 0`;
+    const params: any[] = [];
+
+    const familyConditions = familleEffective.map((f) => {
+      params.push(`%${f.toLowerCase()}%`);
+      return `LOWER(famille) LIKE $${params.length}`;
+    });
+    sql += ` AND (${familyConditions.join(' OR ')})`;
+
+    if (couleursTrouvees.length > 0) {
+      const colorConditions = couleursTrouvees.map((c) => {
+        params.push(`%${c}%`);
+        return `LOWER(couleur) LIKE $${params.length}`;
+      });
+      sql += ` AND (${colorConditions.join(' OR ')})`;
+    }
+
+    if (taillesTrouvees.length > 0) {
+      const sizeConditions = taillesTrouvees.map((t) => {
+        params.push(t);
+        return `taille = $${params.length}`;
+      });
+      sql += ` AND (${sizeConditions.join(' OR ')})`;
+    }
+
+    if (genre) {
+      params.push(genre);
+      sql += ` AND (genre = $${params.length} OR genre = 'mixte')`;
+    }
+
+    sql += ` ORDER BY taille, couleur LIMIT $${params.length + 1}`;
+    params.push(limit);
+
+    const result = await db.query(sql, params);
+    console.log(`✅ Recherche SQL directe : ${result.rows.length} résultats`);
+
+    if (result.rows.length > 0) {
+      return result.rows;
+    }
+  }
+
+  // ⭐ ÉTAPE 2 : Fallback embedding
+  console.log(`🔄 Fallback embedding pour : "${query}"`);
   const queryEmbedding = await embed(query);
+
+  let sql = `SELECT ref, modele, famille, genre, couleur, taille, matiere, saison,
+                    prix_mad, stock, delai_reassort_jours,
+                    1 - (embedding <=> $1) AS similarity
+             FROM products
+             WHERE stock > 0`;
+  const params: any[] = [JSON.stringify(queryEmbedding)];
+
+  if (genre) {
+    sql += ` AND (genre = $${params.length + 1} OR genre = 'mixte')`;
+    params.push(genre);
+  }
+
+  if (famille) {
+    sql += ` AND LOWER(famille) LIKE $${params.length + 1}`;
+    params.push(`%${famille.toLowerCase()}%`);
+  }
+
+  sql += ` ORDER BY embedding <=> $1 LIMIT $${params.length + 1}`;
+  params.push(limit);
+
+  const result = await db.query(sql, params);
+
+  // Filtre pertinence
+  const filtered = result.rows.filter((r: any) => (r.similarity || 0) > 0.3);
+  return filtered.length > 0 ? filtered : result.rows.slice(0, 5);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// OUTIL 1bis — getFamilyVariants
+// ═══════════════════════════════════════════════════════════════
+export async function getFamilyVariants(famille: string) {
   const result = await db.query(
     `SELECT ref, modele, famille, genre, couleur, taille, matiere, saison,
-            prix_mad, stock, delai_reassort_jours,
-            1 - (embedding <=> $1) AS similarity
+            prix_mad, stock
      FROM products
-     WHERE stock > 0
-     ORDER BY embedding <=> $1
-     LIMIT $2`,
-    [JSON.stringify(queryEmbedding), limit]
+     WHERE famille = $1
+     ORDER BY taille, couleur`,
+    [famille]
   );
   return result.rows;
 }
 
 // ═══════════════════════════════════════════════════════════════
-// OUTIL 2 — check_stock (vérifie stock + substituts si rupture)
-// RÈGLE : ne JAMAIS promettre un délai de réapprovisionnement
+// OUTIL 1ter — findVariants
+// ═══════════════════════════════════════════════════════════════
+export async function findVariants(famille: string, taille?: string) {
+  let sql = `SELECT ref, modele, famille, genre, couleur, taille, matiere, saison,
+                    prix_mad, stock
+             FROM products
+             WHERE famille = $1 AND stock > 0`;
+  const params: any[] = [famille];
+
+  if (taille) {
+    sql += ` AND taille = $2`;
+    params.push(taille);
+  }
+
+  sql += ` ORDER BY taille`;
+
+  const result = await db.query(sql, params);
+  return result.rows;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// OUTIL 1quater — getAllFamilies
+// ═══════════════════════════════════════════════════════════════
+export async function getAllFamilies() {
+  const result = await db.query(
+    `SELECT DISTINCT famille, modele, prix_mad,
+            array_agg(DISTINCT taille) FILTER (WHERE stock > 0) AS tailles_dispo,
+            SUM(stock) AS stock_total
+     FROM products
+     GROUP BY famille, modele, prix_mad
+     HAVING SUM(stock) > 0
+     ORDER BY famille`
+  );
+  return result.rows;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// OUTIL 2 — check_stock
 // ═══════════════════════════════════════════════════════════════
 export async function checkStock(ref: string) {
   const result = await db.query(
@@ -80,7 +291,7 @@ export async function checkStock(ref: string) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// OUTIL 3 — calculate_delivery (grille depuis la base)
+// OUTIL 3 — calculate_delivery
 // ═══════════════════════════════════════════════════════════════
 export async function calculateDelivery(city: string) {
   const result = await db.query(
@@ -114,7 +325,6 @@ export async function calculateDelivery(city: string) {
 
 // ═══════════════════════════════════════════════════════════════
 // OUTIL 4 — calculate_cart_total
-// RÈGLE : remise plafonnée à 10%, plancher = max(total, 0)
 // ═══════════════════════════════════════════════════════════════
 export async function calculateCartTotal(
   items: { ref: string; quantity: number }[],
@@ -183,7 +393,7 @@ export async function calculateCartTotal(
 }
 
 // ═══════════════════════════════════════════════════════════════
-// OUTIL 5 — create_order (crée une commande en base)
+// OUTIL 5 — create_order
 // ═══════════════════════════════════════════════════════════════
 export async function createOrder(
   clientId: string,
@@ -196,7 +406,6 @@ export async function createOrder(
   const totalArticles = items.reduce((s, i) => s + i.unit_price * i.quantity, 0);
   const total = Math.max(0, totalArticles + deliveryCost - discount);
 
-  // Générer un ID unique
   const countResult = await db.query(`SELECT COUNT(*) FROM orders`);
   const nextId = `CMD-${String(parseInt(countResult.rows[0].count) + 1).padStart(5, '0')}`;
 
@@ -223,7 +432,6 @@ export async function createOrder(
 
 // ═══════════════════════════════════════════════════════════════
 // OUTIL 6 — verify_discount_eligibility
-// RÈGLE : remise > 10% → escalade humaine obligatoire
 // ═══════════════════════════════════════════════════════════════
 export function verifyDiscountEligibility(discountRequested: number) {
   const eligible = discountRequested <= DISCOUNT_FLOOR;
@@ -288,8 +496,7 @@ export async function getOrCreateCustomer(phone: string) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// OUTIL 9 — get_client_history (mémoire par client)
-// EX-04 : mémoire client
+// OUTIL 9 — get_client_history
 // ═══════════════════════════════════════════════════════════════
 export async function getClientHistory(clientId: string, limit = 5) {
   const client = await db.query(
@@ -326,4 +533,80 @@ export async function searchPolicies(query: string, limit = 3) {
     [JSON.stringify(queryEmbedding), limit]
   );
   return result.rows;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// OUTIL 11 — getOrCreateConversation
+// ═══════════════════════════════════════════════════════════════
+export async function getOrCreateConversation(
+  clientId: string,
+  firstMessage: string
+) {
+  const existing = await db.query(
+    `SELECT * FROM conversations 
+     WHERE client_id = $1 AND status = 'active'
+     AND started_at > NOW() - INTERVAL '24 hours'
+     ORDER BY started_at DESC 
+     LIMIT 1`,
+    [clientId]
+  );
+
+  if (existing.rows.length > 0) {
+    return existing.rows[0];
+  }
+
+  const created = await db.query(
+    `INSERT INTO conversations (client_id, channel, status, messages)
+     VALUES ($1, 'web_simulator', 'active', ARRAY[$2::jsonb])
+     RETURNING *`,
+    [clientId, JSON.stringify({ role: 'client', content: firstMessage })]
+  );
+  return created.rows[0];
+}
+
+// ═══════════════════════════════════════════════════════════════
+// OUTIL 12 — appendMessage
+// ═══════════════════════════════════════════════════════════════
+export async function appendMessage(
+  conversationId: string,
+  role: 'client' | 'agent',
+  content: string
+) {
+  await db.query(
+    `UPDATE conversations 
+     SET messages = messages || ARRAY[$1::jsonb]
+     WHERE id = $2`,
+    [
+      JSON.stringify({ role, content, timestamp: new Date().toISOString() }),
+      conversationId,
+    ]
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// OUTIL 13 — getConversationHistory
+// ═══════════════════════════════════════════════════════════════
+export async function getConversationHistory(clientId: string, limit = 10) {
+  const result = await db.query(
+    `SELECT id, messages, started_at 
+     FROM conversations 
+     WHERE client_id = $1 AND status = 'active'
+     AND started_at > NOW() - INTERVAL '24 hours'
+     ORDER BY started_at DESC 
+     LIMIT 1`,
+    [clientId]
+  );
+
+  if (result.rows.length === 0) {
+    return { conversation_id: null, history: [] };
+  }
+
+  const conv = result.rows[0];
+  const messages = (conv.messages || []).slice(-limit);
+  const history = messages.map((m: any) => ({
+    role: m.role,
+    content: m.content,
+  }));
+
+  return { conversation_id: conv.id, history };
 }
